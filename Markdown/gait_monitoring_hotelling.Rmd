@@ -1,0 +1,845 @@
+---
+title: "A personalized and non-parametric framework for detecting changes in gait cycles"
+author:
+  - name: "Saeb Ragani Lamooki ^[Email: saebraga@buffalo.edu | Website: <a href=\"https://www.linkedin.com/in/saeb-ragani-lamooki-123a9658/\">LinkedIn</a>]"
+    affiliation: Department of Mechanical & Aerospace Engineering, University at Buffalo
+  - name: "Jiyeon Kang ^[Email: jiyeonk@buffalo.edu | Phone: +1-716-645-6063 | Website: <a href=\"http://engineering.buffalo.edu/industrial-systems/people/faculty-directory/j-jang.html\">University at Buffalo Official</a>]"
+    affiliation: Department of Mechanical & Aerospace Engineering, University at Buffalo
+  - name: "Lora A. Cavuoto ^[Email: loracavu@buffalo.edu | Phone: +1-716-645-4696 | Website: <a href=\"http://engineering.buffalo.edu/industrial-systems/people/faculty-directory/cavuoto-lora.html\">University at Buffalo Official</a>]"
+    affiliation: Department of Industrial and Systems Engineering, University at Buffalo
+  - name: "Fadel M. Megahed ^[Email: fmegahed@miamioh.edu | Phone: +1-513-529-4185 | Website: <a href=\"https://miamioh.edu/fsb/directory/?up=/directory/megahefm\">Miami University Official</a>]"
+    affiliation: Farmer School of Business, Miami University
+  - name: "Allison Jones Farmer ^[Email: farmerl2@miamioh.edu | Phone: +1-513-529-4823 | Website: <a href=\"https://miamioh.edu/fsb/directory/?up=/directory/farmerl2\">Miami University Official</a>]"
+    affiliation: Farmer School of Business, Miami University
+bibliography: gaitRefs.bib
+csl: apa.csl
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    number_sections: TRUE
+    theme: simplex
+    paged_df: TRUE
+    code_folding: show
+  includes:
+    in_header: structure.tex
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = TRUE,
+                      progress = FALSE, 
+                      verbose = FALSE,
+                      dpi = 600)
+options(qwraps2_markup = "markdown")
+
+
+```
+
+
+
+
+---
+
+# R Setup and Required Packages
+In this project, the open-source R programming language is used to model/monitor changes in the gait cycles over time. R is maintained by an international team of developers who make the language available at [The Comprehensive R Archive Network](https://cran.r-project.org/). Readers interested in reusing our code and reproducing our results should have R installed locally on their machines. R can be installed on a number of different operating systems (see [Windows](https://cran.r-project.org/bin/windows/), [Mac](https://cran.r-project.org/bin/macosx/), and [Linux](https://cran.r-project.org/bin/linux/) for the installation instructions for these systems). We also recommend using the RStudio interface for R. The reader can [download RStudio](http://www.rstudio.com/ide) for free by following the instructions at the link. For non-R users, we recommend the [Hands-on Programming with R](https://rstudio-education.github.io/hopr/packages.html) for a brief overview of the software's functionality. Hereafter, we assume that the reader has an introductory understanding of the R programming language.
+
+In the code chunk below, we load the packages used to support our analysis.  
+
+```{r packages, cache=FALSE}
+if(require(checkpoint)==FALSE) install.packages("checkpoint") # check to see if checkpoint is installed; if not, install it
+library(checkpoint) # package used to facilitate the reproducibility of our work
+
+# a checkpoint of R packages on CRAN on June 08, 2020 to enable the reproduction of our work in the future
+checkpoint("2020-06-08")
+
+# check if packages are not installed; if yes, install missing packages
+packages = c("tidyverse", "magrittr", # typical data analysis packages
+             "foreach", "parallel", # packages used for parallelizing some code chunks
+             "MALDIquant", # match closest points between two vectors
+             "MASS", # calculates the generalized inverse matrix
+             "fda.usc", # Used for visual diagnostic plotting
+             "R.matlab")
+newPackages = packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(newPackages) > 0) install.packages(newPackages)
+
+# using the library command to load all packages; invisible used to avoid printing all packages and dependencies used
+invisible(lapply(packages, library, character.only = TRUE))
+
+source("./Functions.R") # our custom built functions
+
+set.seed(2020)
+startTime <- Sys.time()
+```
+
+
+---
+
+# Extracting, Transforming and Loading (ETL) the Gait Data into R
+In this paper, we perform a secondary data analysis of the experimental data reported in @baghdadi2019monitoring, where fifteen participants were equipped with an IMU sensor wrapped on their right ankle. We used the IMU data to transform the linear acceleration signals from the local frame of reference to the global frame of reference. Next, we calculated the acceleration magnitude signal and smoothed it by applying a low pass butterworth filter with a cut-off frequency of 10 Hz. Further, we segmented the idividual gait cycles from foot-flat to foot-flat for each participant by tuning the parameters of the segmentation algorithm for each participant.  
+
+We load **four different sets of data** into R:
+
+  -  *Subject heights*, which is read directly from the [GitHub Repository](https://github.com/fmegahed/fatigue-changepoint) of the @baghdadi2019monitoring paper. Note that we have excluded Subject 13's data as the segmentation algorithm falls short of detecting the gaits in this subject. Shape of acceleration magnitude signal did not contain the distinguishable larger peak, commonly reflected in gait cycles. Moreover, we did not include the results for subjects 5 & 7 in our analysis as they did not complete the experiment. This inclusion criteria was considered to allow for enough data to construct the 3 phases effectively.
+  - *Features*, where we extract the positions in Frennet Serret coordinates as well as the stride duration. *Stride length*, *stride height*, and *stride duration* along with *experimental time* for all subjects are subsequently calculated. The $1^{st}$ three are important kinematic features that are used to model/monitor changes in gait in one of the two schemes, implemented in this work. Note that we did not use this data directly from the @baghdadi2019monitoring paper since our segmentation here was from foot-flat to foot-flat and a different cut-off frequency for the Butterworth filter was used (given that the goals of our paper and the original paper are different).    
+  - *Profiles*, where the points forming each gait segment are mantained. The profiles present an alternative approach to monitoring and modeling changes in the gait cycles.   
+  - *Video tags*, contains the time stamps when subjects enter and leave the main laboratory space where the non-walking task (loading/unloading) takes place. This information is used to ensure the consistency of the task being performed by the participant, i.e., we do not want to detect the changes due to a change in the undertaken task, but rather due to fatigue (see the discussion in our manuscript for more details).
+
+The code chunk below provides our code for reading the three different datasets. The *subject heights* dataset is saved into a vector, which we use to scale the computed gait/stride length and height. The main outputs from this chunk are two lists (a) **subjectFeaturesList** which contains the *scaled stride length*, *scaled stride height*, *stride duration* and *experimental time*, and (b) **subjectProfilesList** which contains the sample IMU acceleration magnitude points making each acceleration profile.
+```{r read}
+# Reading the subject Heights from the Baghdadi et al. (2019) GitHub Repo:
+# ------------------------------------------------------------------------
+subject_heights <- read.csv("https://raw.githubusercontent.com/fmegahed/fatigue-changepoint/master/Data/Raw/DemographicData.csv") %>%   pull(Height) %>% `*` (0.01) %>%  .[-13] # pull height and convert into meters
+
+# Computing gait features based on experimental data from Baghdadi et al. (2019):
+# -------------------------------------------------------------------------------
+featureFiles <- list.files(path = "../Data/matFiles/Features/", pattern = "*.mat", full.names = TRUE)
+rawSubjectsData <- lapply(featureFiles, readMat) %>% # read all mat files in Feature List
+  lapply("[[", "M.i.k") # extract sublist titled "M.i.k" from all the lists
+names(rawSubjectsData) <- str_extract_all(featureFiles, "Subject[:digit:]*", simplify = TRUE)
+
+numRows <- lengths(rawSubjectsData)/17 # number of observations per Subject
+
+subjectFeaturesList <- vector(mode = "list", length = length(rawSubjectsData)) # initialize list
+names(subjectFeaturesList) <- names(rawSubjectsData)
+
+for (i in seq(length(rawSubjectsData))) {
+  StrideLength <-  rawSubjectsData[[i]][ 1:numRows[i] ] %>% 
+    lapply(range) %>% lapply(diff) %>% unlist() %>% 
+    `/` (subject_heights[i])
+  
+  StrideHeight <- rawSubjectsData[[i]][ (1+numRows[i]):(2*numRows[i]) ] %>% 
+    lapply(range) %>% lapply(diff) %>% unlist() %>% 
+    `/` (subject_heights[i])
+  
+  StrideDuration <- rawSubjectsData[[i]][ (1+ 2*numRows[i]):(3*numRows[i]) ] %>% 
+    lapply(range) %>% lapply(diff) %>% unlist(recursive = TRUE)
+  
+  expTime <- rawSubjectsData[[i]][ (1+ 16*numRows[i]):(17*numRows[i]) ] %>% 
+    lapply(unlist) %>% lapply(min) %>% unlist()
+  
+  subjectFeaturesList[[i]] <- cbind(StrideLength, StrideHeight, StrideDuration, expTime)
+}
+
+
+# Reading the segmented gait cycles for each participant:
+# -------------------------------------------------------
+profileFiles <- list.files(path = "../Data/matFiles/Profiles/", pattern = "*.mat", full.names = TRUE) 
+subjectProfilesList <- lapply(profileFiles, readMat) %>% # read all mat files from the path above
+  lapply("[[", "gait") # extract sublist titled "gait" from all the lists
+names(subjectProfilesList) <- sapply(profileFiles, str_extract_all, "Subject[:digit:]*", simplify = TRUE)
+
+# Reading task-related based on the tagging of the experimental videos:
+# ---------------------------------------------------------------------
+videoFiles <- list.files(path = "../Data/csvFiles/", pattern = "*.csv", full.names = TRUE) 
+videoDataList <- lapply(videoFiles, read.csv)
+names(videoDataList) <- sapply(videoFiles, str_extract_all, "Subject[:digit:]*", simplify = TRUE)
+
+```
+
+---
+
+# Data Preprocessing and Rational Subgroups
+
+## Data Preprocessing
+In Section 2, we have read four different data sets and extracted the three gait features. In this subsection, we perform further preprocessing of the data. Specifically, we remove the first 10 minutes of experimental data from the `videoDataList` since these corresponded to the warm-up period of the experiment as detailed in @maman2017data, @baghdadi2019monitoring, and @maman2020data. Next, we update the `videoDataList` by preserving the time points when the subject enters and leaves the lab space where the loading/ unloading task occurs. This list will be used in the following code chunks to only preserve the feature/ profile data corresponding to the continues walking periods.
+
+```{r dataCleaning, dependson="read"}
+
+for (i in seq(length(rawSubjectsData))) {
+  videoDataList[[i]] %<>%
+    dplyr::select(Leaves, Enters) %>%
+    apply(MARGIN=2, FUN=na.omit) %>% # removing NA observations
+    as.data.frame %>%
+    mutate(Enters = Enters - 600, Leaves = Leaves - 600) %>% # subtracting 600 seconds for warm-up
+    filter(Enters > 0 & Leaves > 0) # removing observations/tasks, which contained any of the warm-up period
+}
+
+```
+
+
+## Rational Subgroups
+Given the nature of the experimental study, the subjects performed varying tasks that may affect our gait analysis; we have only examined data where the subjects are outside of the main laboratory room since this captures the material handling component of the examined task. An immediate consequence of using only "out-of-the-room" data is that the time differences between the preserved segmented gait cycles is no longer almost constant since relatively large time gaps is introduced to the data that corresponds to the periods of loading/ unloading in the room. For this reason, we have subgrouped the data. Consecutive "out-of-the-room" gait cycles are placed in one subgroup. Statistically speaking, our subgrouping strategy follows the **rational subgrouping** mantra in statistical surveillance. The purpose of rational subgrouping is two-fold:
+
+<!-- Moreover, subgrouping enables us to detect the changes in subgrouped gait cycles instead of individual ones. This results in a more robust monitoring scheme since it can detect more sustained changes. -->
+
+  - Minimize the variability within a subgroup such that the within-group variability captures the natural variability in the gait cycles.
+  - Between group variability can be used to capture the effects of "assignable causes of variability", which can include disease progression, fatigue, etc.
+
+For more details on rational subgrouping, we refer the reader to @montgomery2019introduction for more details. The code chunk below provides our approach to creating the rational subgroups for both the "profile" and "gait features" data sets.
+
+```{r subgroups, warning=FALSE}
+numRows <- lengths(subjectProfilesList)/5
+confidence <- videoDataList %>% lapply(function(x) {mean(x[,2] - x[,1])}) %>%
+  do.call(what=c) %>% `*` (0.05) # 5% confidence for each subgroup
+
+subgroupList <- list()
+for (id in seq(length(rawSubjectsData))) {
+
+  aM <- subjectProfilesList[[id]] %>% do.call(what=c) %>%
+    .[(numRows[[id]]+1):(2*numRows[id])] %>%
+    lapply(as.vector)
+
+  expT <- subjectProfilesList[[id]] %>% do.call(what=c) %>%
+    .[(4*numRows[[id]]+1):(5*numRows[id])] %>%
+    lapply(function(x) {x[1,1]}) %>% do.call(what=c)
+
+  ###########################################################
+  # Match times of walking cycles, extracted from videos, against the experimental times
+  leaveIdx <- match.closest(videoDataList[[id]]$Leaves + confidence[id], expT)
+  enterIdx <- match.closest(videoDataList[[id]]$Enters - confidence[id], expT)
+
+  rmIdx <- c(3000, which(enterIdx - leaveIdx < 5))
+  leaveIdx <- leaveIdx[-rmIdx]
+  enterIdx <- enterIdx[-rmIdx]
+
+  ########################################################## Create subgroups
+  aMList <- list()
+  LHDList <- list()
+  for (i in 1:length(leaveIdx)) {
+    aMList[[i]] <- aM[leaveIdx[i]:enterIdx[i]]
+    LHDList[[i]] <- subjectFeaturesList[[id]][leaveIdx[i]:enterIdx[i],]
+  }
+
+  ######################################### Remove subgroups with length < 20
+  LHDList %<>% .[-{which(lengths(aMList) < 20) %>% c(3000)}]
+  aMList %<>% .[-{which(lengths(aMList) < 20) %>% c(3000)}]
+
+  ######################################### Remove observations with profiles< 2nd percentile profile length; This is done to cut all profiles at this length (equal number of features)
+  cutLen <- aMList %>% do.call(what=c) %>% lengths() %>% quantile(probs=0.02)
+  for (i in 1:length(aMList)) {
+    rmIdx <- which(lengths(aMList[[i]]) < cutLen) %>% c(3000)
+    aMList[[i]] <- aMList[[i]][-rmIdx]
+    LHDList[[i]] <- LHDList[[i]][-rmIdx,]
+  }
+
+  ######################################## Create a matrix with cutLen number of columns in each profile subgroup
+  aMList %<>% lapply(function(x) {do.call(rbind, x)}) %>%
+    lapply(function(x) {x[,1:cutLen]})
+
+  ############################################ Lengths of subgroups 0&1: 10&20
+  subgroupList[[id]] <- list(Acc = list(X0=aMList[1:10], X1=aMList[11:30], X2=aMList[31:length(aMList)]),
+                             LHD = list(X0=LHDList[1:10], X1=LHDList[11:30], X2=LHDList[31:length(LHDList)]))
+}
+names(subgroupList) <- c(paste0("subject", c(1:12, 14:15)))
+
+```
+
+
+# $T^2$ Charts
+
+Using $T^2$ statistic, we compared the mean of subgroups against a reference multivariate distribution by accounting for the correlation between different variables. We calculated the $T^2$ for subgroups using the method introduced in @mason2001applying. Also, to construct a $T^2$ chart, one needs to find the control limits. The control limits are conventionally calculated using the distribution parameters. However, as we investigated the gait data in our analysis, it did not follow any parametric distribution. Therefore, we implemented a non-parametric approach to bootstrap the control limits in both retrospective and prospective phases using the method in @phaladiganon2011bootstrap.
+
+Our $T^2$ charting approach is comprised of 3 phases as described below:
+
+1. **phase 0:** The purpose of phase 0 is to construct a clean *in-control* data set that captures the distribution of the reference data. In this phase we removed the outliers in one pass and updated the subgroups. Then we calculated the within-batch covariance and subgroup means to be used in the following phases.
+
+2. **phase 1:** Although this phase is part of the prospective phase, the control limit for the prospective phase is calculated using the data in this phase. This is due to the fact that the distribution of the data in retrospective phase differs from that of prospective phase and therefore cannot be directly used for bootstrapping the control limits. To that end, phase 1 data were isolated from the prospective phase to bootstrap the control limit. Note that this set of data were not involved for calculation of the covariance in phase 0.
+
+3. **phase 2:** The $T^2$ was calculated for each prospective subgroup using the mean and covariance from phase 0. The $T^2$ chart was constructed and the $T^2$ for each subgroup was compared against the control limit. The chart's purpose is to generates an *out-of-control* signal when the $T^2$ is larger than the control limit. The signal means that the change is associated with an assignable cause that could not be justified by random variation in the reference data distribution.
+
+We constructed the $T^2$ charts for 2 sets of gait data to monitor the gait changes in 2 different schemes. In the first scheme we used the acceleration profiles and in the second scheme we used the gait features. In the following sections we provide more details for each scheme.
+
+## $1^{st}$ Scheme: $T^2$ Chart for Gait Acceleration Profiles
+
+The linear acceleration signals as well as angular velocity signals were collected from the IMU and preprocessed in a matlab code to calculate the acceleration in the global frame of reference. We removed the gravity from the vertical component, calculated the acceleration magnitude, and smoothed it using a $4^{th}$ order Butterworth low-pass filter. Start and end points in each gait cycle were detected using the topological features of the acceleration magnitude and vertical acceleration signals and were used to segment the acceleration magnitude signal. Each segment, henceforth acceleration profile, contained different number of data points. We could downsample the data to include equal number of data points in each profile, however, this would have registered the curves and removed crucial information in terms of gait duration. Therefore, we removed significantly shorter profiles (profiles shorter than the $2^{nd}$ percentile of all profile length in each cylce) and trimmed the remaining profiles at their shortest length. Next, we implemented our $T^2$ charting approach on the gait profiles in the following cone snippet.
+
+
+```{r T2Profiles}
+T2Profiles <- list()
+for (id in seq(length(subgroupList))) {
+  X0 <- subgroupList[[id]]$Acc$X0
+
+  ############################# Phase0
+  ############################# Remove single outliers in number of passes
+  pass <- 1
+  for (i in 1:pass) {
+    UCL0 <- BootstrapUCL0(x0=X0, alpha=0.05, iterations=200) # Find in Functions
+    ######################### Find T2 for original X0 and remove outliers from subgroups
+    X0Pooled <- do.call(rbind, X0)
+    T2 <- X0Pooled %>% apply(FUN=mean, MARGIN=2) %>%
+      rep.row(n=nrow(X0Pooled)) %>% -(X0Pooled) %>%
+      apply(MARGIN=1, function(x) {x %*% ginv(cov(X0Pooled)) %*% x})
+
+    tmp <- mapply(function(x,y) {rep(y, x)}, x=sapply(X0, nrow), y=1:10) %>% do.call(what=c)
+    OCIdx <- T2 %>% split(f=tmp) %>% lapply(function(x) {c(which(x>UCL0), 3000)})
+    X0 %<>% mapply(FUN=function(x, y) {x[-y,]}, y=OCIdx) # Updated X0 after phase0
+  }
+
+  X0Pooled <- do.call(rbind, X0)
+  X0PooledMean <- colMeans(X0Pooled)
+
+  ############################# Within batch covariance; computed from phase0 after outlier removal
+  S_w <- X0 %>% lapply(colMeans) %>%
+    mapply(FUN=rep.row, sapply(X0, nrow)) %>% # Mean of each subgroup
+    mapply(FUN=function(x,y) {x-y}, y=X0, SIMPLIFY=F) %>%
+    lapply(function(x) {t(x) %*% x}) %>%
+    Reduce(f=`+`) %>%
+    `/` (sum(lengths(X0)/ncol(X0[[1]])) - length(X0))
+
+  ############################# Phase1&2
+  ############################# Read phase 1&2 subgroups
+  X1 <- subgroupList[[id]]$Acc$X1
+  X2 <- subgroupList[[id]]$Acc$X2
+
+  ######################### Compute T2 in phase1
+  X1Mean <- sapply(X1, colMeans) %>% t()
+  T2 <- rep.row(X0PooledMean, length(X1)) %>% -(X1Mean) %>%
+    apply(MARGIN=1, function(x) x %*% ginv(S_w) %*% x)
+
+  ######################### Bootstrap UCL using phase 1 data
+  sampled <- sample(T2, 1000*length(T2), replace=T) %>% matrix(ncol=length(T2), byrow=T)
+  UCL <- apply(sampled, 1, quantile, probs=0.99) %>% mean()
+
+  ######################### T2 for phase2 data
+  X12Mean <- sapply(c(X1, X2), colMeans) %>% t()
+  T2 <- rep.row(X0PooledMean, length(c(X1, X2))) %>% -(X12Mean) %>%
+    apply(MARGIN=1, function(x) x %*% ginv(S_w) %*% x)
+  T2Profiles[[id]] <- list(T2=T2, UCL=UCL, UCL0=UCL0)
+}
+names(T2Profiles) <- paste0("subject", c(1:12, 14:15))
+```
+
+
+### Plots of Phase 0 $T^2$ on Gait Acceleration Profiles along with Reported RPE {.tabset .tabset-fade}
+
+Below, we visualized the phase 0 $T^2$ charts for individual gaits. The control limit is bootstrapped and used to define the outlying gaits. The gaits with a $T^2$ larger than the control limit (shown in red) are removed from their corresponding subgroups. Next, we calculated the within-batch covariance using the updated subgroups.
+
+
+```{r T2Profilesphase0, fig.align='center', results='asis', out.width="100%"}
+
+for (id in seq(length(subgroupList))) {
+
+  X0Pooled <- subgroupList[[id]]$Acc$X0 %>% do.call(what=rbind)
+  T2_0 <- rep.row(colMeans(X0Pooled), n=nrow(X0Pooled)) %>% -(X0Pooled) %>%
+    apply(MARGIN=1, function(x) {x %*% ginv(cov(X0Pooled)) %*% x})
+
+  UCL0 <- T2Profiles[[id]]$UCL0
+
+  ###############################################################
+  ############################################################### T2_0 plot
+  T2_0.df <- data.frame(gait=1:length(T2_0), T2_0=T2_0, col=ifelse(T2_0>UCL0, "OC", "IC"))
+
+  T2_0_plot <- ggplot(data=T2_0.df) +
+    geom_point(aes(x=gait, y=T2_0, color=col), size=2) +
+    scale_colour_manual(values = c("black", "red")) +
+
+    geom_hline(yintercept=UCL0) +
+    annotate("text", 2, UCL0, vjust=-1, label="UCL", size=5) +
+
+    ggtitle(paste0("Subject ", id)) +
+    xlab("Gait Index") + ylab(expression(T^2 ~ " in Phase 0")) +
+
+    theme_bw() +
+    theme(plot.title=element_text(size = 20, hjust=0.5, margin = margin(t=10, b=-30)),
+          axis.text=element_text(size=15),
+          axis.title=element_text(size=20, color="black"),
+          legend.title=element_blank(), # This removes the legend title
+          legend.position=c(.1, .85),
+          legend.text=element_text(size=15),
+          legend.key = element_rect(fill="grey"),
+          legend.box.background = element_rect(colour = "black"))
+
+  cat('####',paste0("Subject", id), "{-}",'\n')
+  print(T2_0_plot)
+  cat('\n \n')
+}
+
+```
+
+
+
+### Plots of $T^2$ on Gait Acceleration Profiles along with Reported RPE {.tabset .tabset-fade}
+
+The final $T^2$ charts for the prospective phase are plotted below. The inverted triangles represent the phase 1 data and the dots represent phase 2 data. We also included the RPE values that were reported by the subjects every 10 minutes during the experiment on a different scale on the right axis. Although the purpose of the study is to detect the change in gait patterns, the RPE plots provide some insight for the utility of the work for its potential application in fatigue detection.
+
+```{r T2ProfilesRPEPlot, fig.align='center', results='asis', out.width="100%"}
+
+RPE <- read.csv("https://raw.githubusercontent.com/fmegahed/gait_hotelling/master/Data/csvFiles/RPE/RPE.csv") %>% .[,-14]
+
+SubgroupTimeList <- subgroupList %>% lapply(function(x) {x$LHD[c(2,3)]}) %>%
+  lapply(function(x) {do.call(c, x)}) %>%
+  lapply(function(x) {sapply(x, function(a) {median(a[,4])})})
+
+for (id in seq(length(subgroupList))) {
+  # for (id in 1:2) {
+  T2 <- T2Profiles[[id]]$T2
+  T2Time <- SubgroupTimeList[[id]]
+  UCL <- T2Profiles[[id]]$UCL
+  color <- ifelse(T2>UCL, "OC", "IC")
+  T2.df <- data.frame(T2Time=T2Time, T2=T2, col=color,
+                      shape=c(rep("Phase 1", 20), rep("Phase 2", length(T2) - 20)))
+  
+  RPE.df <- data.frame(RPETime=RPE[,1], RPE=RPE[,id+1])
+  
+  ############# Needed to plot the secondary axis
+  ylim.prim <- range(pretty(T2))
+  ylim.sec <- c(6,20)
+  
+  b <- diff(ylim.prim)/diff(ylim.sec)
+  a <- b*(ylim.prim[1] - ylim.sec[1])
+  
+  ############# 
+  
+  T2Plot <- ggplot(data=T2.df) +
+    geom_point(aes(x=T2Time, y=T2, shape=shape, col=col), size=2.5) +
+    geom_line(aes(x=T2Time, y=T2)) +
+    xlab("Experiment Time (s)") + ylab(expression(paste("T"^2, " Profiles"))) +
+    
+    geom_line(data=RPE.df, mapping=aes(x=RPETime, y=a+RPE*b), color="blue", size=1) +
+    # annotate("text", x=RPE.df$RPETime[5], y=(RPE.df$RPE[5]*b*1.1)+a, label="RPE", 
+    #        size=5, color="blue") +
+    scale_y_continuous(limits=ylim.prim,
+                       sec.axis=sec_axis(trans=~ (. - a)/b,
+                                       name="RPE Borg Scale", breaks=seq(6,20,2))) +
+
+    geom_hline(yintercept=UCL) +
+    annotate("text", 2, UCL, vjust=-1, label="UCL", size=5) +
+
+    scale_shape_manual(values = c(6, 16)) +
+    scale_color_manual(values = c("black", "red")) +
+    ggtitle(paste0("Subject ", id)) +
+
+    theme_bw() +
+    theme(plot.title=element_text(size = 20, hjust=0.5, margin = margin(t=10, b=-30)),
+          axis.text=element_text(size=15),
+          axis.title=element_text(size=20, color="black"),
+          legend.title=element_blank(), # This removes the legend title
+          legend.position=c(.1, .68),
+          legend.text=element_text(size=10),
+          legend.key = element_rect(fill="grey"),
+          legend.box.background = element_rect(colour = "black"),
+          axis.title.y.right=element_text(color="blue"),
+          axis.text.y.right=element_text(color="blue"))
+
+  cat('####',paste0("Subject", id), "{-}",'\n')
+  print(T2Plot)
+  cat('\n \n')
+}
+```
+
+
+## $2^{nd}$ Scheme: $T^2$ Chart for Gait Features
+
+As explained in section 4.1, the acceleration profiles were segmented for each gait cycle. In the second scheme the gait features (stride length, height, and duration) were calculated for each segmented gait cycle. In the following code chunk we implemented our $T^2$ charting method on the gait features.
+
+
+```{r T2Features}
+T2Features <- list()
+SWList <- list()
+X0Updated <- list()
+for (id in seq(length(subgroupList))) {
+  X0 <- subgroupList[[id]]$LHD$X0 %>% lapply(function(x) {x=x[,1:3]}) # Last column contains experiment time
+
+  ############################# Phase0
+  ############################# Remove single outliers in number of passes
+  pass <- 1
+  for (i in 1:pass) {
+    UCL0 <- BootstrapUCL0(x0=X0, alpha=0.05, iterations=200) # Find in Functions
+    ######################### Find T2 for original X0 and remove outliers from subgroups
+    X0Pooled <- do.call(rbind, X0)
+    T2 <- rep.row(colMeans(X0Pooled), n=nrow(X0Pooled)) %>% -(X0Pooled) %>%
+      apply(MARGIN=1, function(x) {x %*% ginv(cov(X0Pooled)) %*% x})
+
+    tmp <- mapply(function(x,y) {rep(y, x)}, x=sapply(X0, nrow), y=1:10) %>% do.call(what=c)
+    OCIdx <- T2 %>% split(f=tmp) %>% lapply(function(x) {c(which(x>UCL0), 3000)})
+    X0 %<>% mapply(FUN=function(x, y) {x[-y,]}, y=OCIdx) # Updated X0 after phase0
+  }
+  X0Pooled <- do.call(rbind, X0)
+  X0PooledMean <- colMeans(X0Pooled)
+
+  ############################# Within batch covariance; computed from phase0 after outlier removal
+  S_w <- X0 %>% lapply(colMeans) %>%
+    mapply(FUN=rep.row, sapply(X0, nrow)) %>% # Mean of each subgroup
+    mapply(FUN=function(x,y) {x-y}, y=X0, SIMPLIFY=F) %>%
+    lapply(function(x) {t(x) %*% x}) %>%
+    Reduce(f=`+`) %>%
+    `/` (sum(lengths(X0)/ncol(X0[[1]])) - length(X0))
+
+  ############################# Phase1&2
+  ############################# Read phase 1&2 subgroups
+  X1 <- subgroupList[[id]]$LHD$X1 %>% lapply(function(x) {x=x[,1:3]})
+  X2 <- subgroupList[[id]]$LHD$X2 %>% lapply(function(x) {x=x[,1:3]})
+
+  ######################### Compute T2 in phase1
+  X1Mean <- sapply(X1, colMeans) %>% t()
+  T2 <- rep.row(X0PooledMean, length(X1)) %>% -(X1Mean) %>%
+    apply(MARGIN=1, function(x) x %*% ginv(S_w) %*% x)
+
+  ######################### Bootstrap UCL using phase 1 data
+  sampled <- sample(T2, 1000*length(T2), replace=T) %>% matrix(ncol=length(T2), byrow=T)
+  UCL <- apply(sampled, 1, quantile, probs=0.99) %>% mean()
+
+  ######################### T2 for phase2 data
+  X12Mean <- sapply(c(X1, X2), colMeans) %>% t()
+  T2 <- rep.row(X0PooledMean, length(c(X1, X2))) %>% -(X12Mean) %>%
+    apply(MARGIN=1, function(x) x %*% ginv(S_w) %*% x)
+
+  T2Features[[id]] <- list(T2=T2, UCL=UCL, UCL0=UCL0)
+  X0Updated[[id]] <- list(X0=X0)
+  SWList[[id]] <- list(S_w=S_w)
+}
+names(T2Features) <- paste0("subject", c(1:12, 14:15))
+names(X0Updated) <- paste0("subject", c(1:12, 14:15))
+names(SWList) <- paste0("subject", c(1:12, 14:15))
+```
+
+
+### Plots of Phase 0 $T^2$ on Gait Features along with Reported RPE {.tabset .tabset-fade}
+
+Below we present the $T^2$ charts for phase 0 where the outliers are detected and removed from the data.
+
+```{r T2Featuresphase0, fig.align='center', results='asis', out.width="100%"}
+for (id in seq(length(subgroupList))) {
+  
+  X0Pooled <- subgroupList[[id]]$LHD$X0 %>% do.call(what=rbind) %>% .[,1:3]
+  T2_0 <- rep.row(colMeans(X0Pooled), n=nrow(X0Pooled)) %>% -(X0Pooled) %>%
+    apply(MARGIN=1, function(x) {x %*% ginv(cov(X0Pooled)) %*% x})
+  
+  UCL0 <- T2Features[[id]]$UCL0
+  
+  ###############################################################
+  ############################################################### T2_0 plot
+  T2_0.df <- data.frame(gait=1:length(T2_0), T2_0=T2_0, col=ifelse(T2_0>UCL0, "OC", "IC"))
+  
+  T2_0_plot <- ggplot(data=T2_0.df) +
+    geom_point(aes(x=gait, y=T2_0, color=col), size=2) +
+    scale_colour_manual(values = c("black", "red")) +
+    
+    geom_hline(yintercept=UCL0) +
+    annotate("text", 2, UCL0, vjust=-1, label="UCL", size=5) +
+    
+    ggtitle(paste0("Subject ", id)) +
+    xlab("Gait Index") + ylab(expression(T^2 ~ " in Phase 0")) +
+    
+    theme_bw() +
+    theme(plot.title=element_text(size = 20, hjust=0.5, margin = margin(t=10, b=-30)),
+          axis.text=element_text(size=15),
+          axis.title=element_text(size=20, color="black"),
+          legend.title=element_blank(), # This removes the legend title
+          legend.position=c(.1, .85),
+          legend.text=element_text(size=15),
+          legend.key = element_rect(fill="grey"),
+          legend.box.background = element_rect(colour = "black"))
+  
+  
+  cat('####',paste0("Subject", id), "{-}",'\n')
+  print(T2_0_plot)
+  cat('\n \n')
+  
+}
+```
+
+
+
+### Plots of $T^2$ on Gait Features along with Reported RPE {.tabset .tabset-fade}
+
+Belowe we present the prospective phase $T^2$ charts for the $2^{nd}$ scheme. The charts show consistent results with the $T^2$ charts in the $1^{st}$ scheme.
+
+
+```{r T2FeaturesRPEPlot, fig.align='center', results='asis', out.width="100%"}
+
+RPE <- read.csv("https://raw.githubusercontent.com/fmegahed/gait_hotelling/master/Data/csvFiles/RPE/RPE.csv") %>% .[,-14]
+
+SubgroupTimeList <- subgroupList %>% lapply(function(x) {x$LHD[c(2,3)]}) %>%
+  lapply(function(x) {do.call(c, x)}) %>%
+  lapply(function(x) {sapply(x, function(a) {median(a[,4])})})
+
+for (id in seq(length(subgroupList))) {
+  # for (id in 1:2) {
+  T2 <- T2Features[[id]]$T2
+  T2Time <- SubgroupTimeList[[id]]
+  UCL <- T2Features[[id]]$UCL
+  color <- ifelse(T2>UCL, "OC", "IC")
+  T2.df <- data.frame(T2Time=T2Time, T2=T2, col=color,
+                      shape=c(rep("Phase 1", 20), rep("Phase 2", length(T2) - 20)))
+  
+  RPE.df <- data.frame(RPETime=RPE[,1], RPE=RPE[,id+1])
+  
+  ############# Needed to plot the secondary axis
+  ylim.prim <- range(pretty(T2))
+  ylim.sec <- c(6,20)
+  
+  b <- diff(ylim.prim)/diff(ylim.sec)
+  a <- b*(ylim.prim[1] - ylim.sec[1])
+  
+  ############# 
+  
+  T2Plot <- ggplot(data=T2.df) +
+    geom_point(aes(x=T2Time, y=T2, shape=shape, col=col), size=2.5) +
+    geom_line(aes(x=T2Time, y=T2)) +
+    xlab("Experiment Time (s)") + ylab(expression(paste("T"^2, " Features"))) +
+    
+    geom_line(data=RPE.df, mapping=aes(x=RPETime, y=a+RPE*b), color="blue", size=1) +
+    # annotate("text", x=RPE.df$RPETime[5], y=(RPE.df$RPE[5]*b*1.1)+a, label="RPE", 
+    #        size=5, color="blue") +
+    scale_y_continuous(limits=ylim.prim,
+                       sec.axis=sec_axis(trans=~ (. - a)/b,
+                                       name="RPE Borg Scale", breaks=seq(6,20,2))) +
+
+    geom_hline(yintercept=UCL) +
+    annotate("text", 2, UCL, vjust=-1, label="UCL", size=5) +
+
+    scale_shape_manual(values = c(6, 16)) +
+    scale_color_manual(values = c("black", "red")) +
+    ggtitle(paste0("Subject ", id)) +
+
+    theme_bw() +
+    theme(plot.title=element_text(size = 20, hjust=0.5, margin = margin(t=10, b=-30)),
+          axis.text=element_text(size=15),
+          axis.title=element_text(size=20, color="black"),
+          legend.title=element_blank(), # This removes the legend title
+          legend.position=c(.1, .68),
+          legend.text=element_text(size=10),
+          legend.key = element_rect(fill="grey"),
+          legend.box.background = element_rect(colour = "black"),
+          axis.title.y.right=element_text(color="blue"),
+          axis.text.y.right=element_text(color="blue"))
+
+  cat('####',paste0("Subject", id), "{-}",'\n')
+  print(T2Plot)
+  cat('\n \n')
+}
+```
+
+# Diagnosis of Gait Features
+
+For acceleration profile monitoring we provide a visual diagnostic tool where the change in the profiles are compared against the *in-control* profiles. For feature monitoring scheme we implemented a quantitative diagnostic approach along with visual tools.
+
+## Visual Inspection of Profile $T^2$ {.tabset .tabset-fade}
+
+For acceleration profiles we visualized the gait profiles in an *out-of-control* subgroup against the profiles in phase 0. In the following plots we present the profiles in the subgroup with largest $T^2$ value in every subject. The *out-of-control* profiles are plotted in red agains the phase 0 profiles in gray. These plots provides insights about the nature of change in gait profiles that caused the signal. The two most prominent changes that are observed in gait profiles are emerged as reduction in profile peak values as well as shifts in the location of the peaks. While different peak values indicate the change in the acceleration magnitude the shift indicates change in the gait duration.
+
+```{r T2ProfilesVisDiag, fig.align='center', results='asis', out.width="100%"}
+
+
+for (id in seq(length(subgroupList))) {
+  
+  ##################### Create the acc matrix with ncol=largest length with NA's 
+  a <- subjectProfilesList[id][[1]] %>% .[(numRows[id]+1):(2*numRows[id])] %>%
+    lapply(unlist) %>% lapply(as.vector)
+  
+  a %<>% lapply(function(x) {c(x, rep(NA, (max(lengths(a)) - length(x))))}) %>%
+    do.call(what=rbind)
+  
+  ##################### Find cleaned phase 0 indices in acc matrix
+  X0Pooled <- subgroupList[[id]]$Acc$X0 %>% do.call(what=rbind)
+  T2_0 <- rep.row(colMeans(X0Pooled), n=nrow(X0Pooled)) %>% -(X0Pooled) %>%
+    apply(MARGIN=1, function(x) {x %*% ginv(cov(X0Pooled)) %*% x})
+  
+  UCL0 <- T2Profiles[[id]]$UCL0
+  
+  phase0Idx <- setdiff(1:nrow(X0Pooled), which(T2_0>UCL0))
+  
+  ##################### Find indices of observations within subgroup with largest T2 in acc matrix
+  expT <- subjectProfilesList[id][[1]] %>% .[(4*numRows[id]+1):(5*numRows[id])] %>%
+    sapply(function(x) {x[[1]][1,1]})
+  
+  subgIdx <- T2Profiles[[id]]$T2[21:length(T2Profiles[[id]]$T2)] %>%
+    which.max() # Subgroup with highest T2 in X2 (phase 2)
+  LargestT2Times <- subgroupList[[id]]$LHD$X2[[subgIdx]][,4]
+  OCIdx <- match.closest(LargestT2Times, expT)
+  
+  ##################### Plot
+  
+  cat('###',paste0("Subject", id), "{-}",'\n')
+  
+  plot(fdata(a[phase0Idx,]), col="grey", ylim=c(-5, 40), xlim=c(0, 70),
+     xlab="Gait Time Index", ylab="Acceleration Magnitude",
+     cex.axis=1.5, cex.lab=1.5, cex.main=1.5,
+     main="Profile Visual Inspection")
+
+  # rect(par("usr")[1],par("usr")[3],par("usr")[2],par("usr")[4],col=gray(0.7, 0.3))
+  grid(col="gray")
+  lines(fdata(a[OCIdx,]), col="red")
+  legend("topleft", legend=c("Phase 0 Profiles Excluding Outliers",
+                             expression("Profiles Within the Subgroup with Largest T"^2)),
+         lty=1, col=c("grey", "red"), lwd=4, cex=1)
+  
+  cat('\n \n')
+}
+```
+
+## Decomposition of Features $T^2$ {.tabset .tabset-fade}
+
+For feature monitoring scheme we decomposed the $T^2$ statistic for each individual feature as well as each pair of the features. Calculation of the decomposed components were performed similar to the $T^2$ calculation explained in previous sections. We also calculated the control limits for each decomposition using similar bootstrapping technique. Below the decomposition results for all *out-of-control* subgroups along with their control limits are presented for each subject.
+
+
+```{r T2Decompose, results='asis'}
+
+qList <- list()
+for (id in seq(length(subgroupList))) {
+# for (id in 1:2) {
+  ############### Read inputs
+  X0 <- X0Updated[[id]]$X0
+  X1 <- subgroupList[[id]]$LHD$X1 %>% lapply(function(x) {x=x[,1:3]})
+  X2 <- subgroupList[[id]]$LHD$X2 %>% lapply(function(x) {x=x[,1:3]})
+  X0PooledMean <- do.call(rbind, X0) %>% colMeans()
+  X1Mean <- sapply(X1, colMeans) %>% t()
+  X12Mean <- sapply(c(X1, X2), colMeans) %>% t()
+  S_w <- SWList[[id]]$S_w
+
+  T2 <- T2Features[[id]]$T2
+  UCL <- T2Features[[id]]$UCL
+  t3 <- which(T2 > UCL)
+  p <- 3 # number of features
+  alpha <- 0.01
+
+  ############## T2 Decomposition and UCL's
+  q <- init.decomp(p=p) # initialize the decomposition matrix
+  for(i in 1:nrow(q)) {# Control limits for each component of the decomposition
+    b <- subset(q[i,3:ncol(q)], q[i,3:ncol(q)] > 0)
+
+    T2 <- rep.row(X0PooledMean[b], length(X1)) %>% -(X1Mean[,b]) %>%
+      apply(MARGIN=1, function(x) x %*% solve(S_w[b,b]) %*% x)
+
+    sampled <- matrix(sample(T2, 1000 * length(T2), replace=T), ncol=20, byrow=T)
+    q[i,2] <- apply(sampled, 1, quantile, probs=1-alpha) %>% mean() %>% round(digits=3)
+  }
+
+  ############## Decompose T2 for every out of control data point
+  cat('###',paste0("Subject", id), "{.tabset .tabset-fade}", '\n')
+  
+  tmpList <- list()
+  for(ii in 1:length(t3)){
+    for(i in 1:nrow(q)) {
+      b <- subset(q[i,3:ncol(q)], q[i,3:ncol(q)] > 0)
+      q[i,1] <- t(X0PooledMean[b]-X12Mean[t3[ii],][b]) %*%
+        solve(S_w[b,b]) %*%
+        (X0PooledMean[b]-X12Mean[t3[ii],][b]) %>% round(digits=3)
+    }
+    ############ Store decomposed elements
+    tmp <- data.frame(q)
+    tmp <- replace(tmp, tmp==1, "Stride Length")
+    tmp <- replace(tmp, tmp==2, "Stride Height")
+    tmp <- replace(tmp, tmp==3, "Stride Duration")
+    tmp <- replace(tmp, tmp==0, "-")
+    tmpList[[ii]] <- tmp
+    colnames(tmpList[[ii]]) <- c("Decomposition", "Control Limit",
+                                 "Selected Feature 1", "Selected Feature 2",
+                                 "Selected Feature 3")
+    
+    cat('####',paste0("subgroup ", t3[[ii]]), "{-}",'\n')
+    print(knitr::kable(tmpList[[ii]]))
+    cat('\n \n')
+    
+  }
+  
+  cat('\n \n')
+  
+  names(tmpList) <- paste0("subgroup ", t3)
+  qList[[id]] <- tmpList
+}
+names(qList) <- paste0("subject", c(1:12, 14:15))
+
+# write.csv(qList[[1]][[1]], file="C:/Users/Saeb/Desktop/decomposition.csv", quote=F)
+# write.table(qList[[1]][[1]], file="C:/Users/Saeb/Desktop/decomposition.txt", quote=F)
+```
+
+
+## 2D Ellipse plots {.tabset .tabset-fade}
+
+We also provide ellipse charts for the $T^2$ decomposition in the gait feature monitoring scheme. Each chart contains the decomposition results for a pair of features. Since in this scheme we work with 3 features, there will be three paired combination of features and thus three ellipse charts for each subject. The straight lines show the control limits for individual features and the ellipse visualizes the control limit for the feature pair. The ellipse charts enable us to see whether the individual features fall outside their univariate limits or a change in the correlation between the two features caused the *out-of-control* signal. They also help understanding the extent of contribution of each feature/ feature pair to the signal. Below we provide the charts for each subject where each subgroup is depicted by the subgroup number and the *out-of-control* subgroups are colored in red.
+
+
+```{r Ellipsechart, fig.align='center', results='asis', out.width="100%"}
+################ Select subject number and features
+
+for (id in seq(length(subgroupList))) {
+  ################ Read inputs
+  X0 <- X0Updated[[id]]$X0
+  X1 <- subgroupList[[id]]$LHD$X1 %>% lapply(function(x) {x=x[,1:3]})
+  X2 <- subgroupList[[id]]$LHD$X2 %>% lapply(function(x) {x=x[,1:3]})
+  X0Pooled <- do.call(rbind, X0)
+  X0PooledMean <- do.call(rbind, X0) %>% colMeans()
+  X1Pooled <- do.call(rbind, X1)
+  S_w <- SWList[[id]]$S_w
+  q <- qList[[id]][[1]] # Read one of the q's as its 2nd column (q[,2]) are the control limits and thus the same across all subgroups in one subject
+  T2 <- T2Features[[id]]$T2
+  UCL <- T2Features[[id]]$UCL
+  
+  cat('###',paste0("Subject", id), "{.tabset .tabset-fade}", '\n')
+  
+  featurePair <- combn(x=length(X0PooledMean), m=2)
+  for (i in seq(ncol(featurePair))) {
+    f <- featurePair[,i] # 2 selected features; The features to investigate should be selected by 1st interpreting the T2 decomposition, however here we provide ellipse charts for all combinations
+    ################ Univariate CL's and 2D plot limits
+    XLim <- c(X0PooledMean[f[1]]-sqrt(S_w[f[1],f[1]]*q[f[1],2]),
+              X0PooledMean[f[1]]+sqrt(S_w[f[1],f[1]]*q[f[1],2]))
+    
+    YLim <- c(X0PooledMean[f[2]]-sqrt(S_w[f[2],f[2]]*q[f[2],2]),
+              X0PooledMean[f[2]]+sqrt(S_w[f[2],f[2]]*q[f[2],2]))
+    
+    xlim <- c(min(XLim) - 1.2*diff(XLim), max(XLim) + 1.2*diff(XLim))
+    ylim <- c(min(YLim) - 1.2*diff(YLim), max(YLim) + 1.2*diff(YLim))
+    
+    ################ Create grid for the ellipse contour plot
+    ngrid <- 100
+    grid <- cbind(seq(xlim[1], xlim[2], length=ngrid),
+                  seq(ylim[1], ylim[2], length=ngrid))
+    
+    ################  T2 on the grid points
+    T2_grid <- apply(expand.grid(grid[,1], grid[,2]), 1,
+                     function(x) {(x- X0PooledMean[f]) %*% solve(S_w[f,f]) %*% (x- X0PooledMean[f])})
+    T2_grid <- matrix(T2_grid, ngrid, ngrid)
+    
+    cat('####',paste("Features", f[1], "&", f[2]), "{-}",'\n')
+    ######################################################## Plot
+    ############## Plot the contour
+    # old.par <- par()
+    
+    # par(mar=c(5, 5, 4, 2) + 0.1)
+    
+    plot(1 ,1, type = "n", xlim = xlim, ylim = ylim, main="Ellipse Chart",
+         xlab=paste0(colnames(X0[[1]])[f[1]], " (m)"),
+         ylab=paste0(ylab=colnames(X0[[1]])[f[2]], " (s)"),
+         cex.axis=1.5, cex.lab=1.5, cex.main=1.5)
+    
+    grid()
+    
+    legend("topleft", legend=c("phase 0 subgroup means", "phase 1 subgroup means",
+                               "X control limits", "Y control limits"),
+           col=c("darkgreen", "blue", "black", "brown"), pch=c(3,3,NA,NA), lty=c(NA,NA,2,2),
+           cex=1, pt.cex=1.2, lwd=2, bg=gray(0.9), y.intersp=0.8)
+    ################
+    tmp <- c("Stride Length", "Stride Height", "Stride Duration")[f]
+    idx <- apply(q[,3:5], MARGIN=1, function(r) all(c(tmp, "-") %in% r)) %>% which()
+    contour(grid[,1], grid[,2], T2_grid, levels=q[idx,2], drawlabels=T, add=T, labcex=1)
+    
+    ################ Plot phase 0 data
+    center0 <- X0 %>% lapply(function(x) {x[,f]}) %>% sapply(colMeans) %>% t()
+    points(center0[,1], center0[,2], pch=3, cex=1.5, col="darkgreen", lwd=2)
+    # points(X0Pooled[,f], pch=1, cex=0.5, col="blue")
+    
+    ################ Plot phase 1 data
+    center1 <- X1 %>% lapply(function(x) {x[,f]}) %>% sapply(colMeans) %>% t()
+    points(center1[,1], center1[,2], pch=3, cex=1.5, col="blue", lwd=2)
+    # points(X1Pooled[,f], pch=1, cex=0.5, col="blue")
+    
+    ################ plot phase 1&2 data by subgroup number
+    center12 <- c(X1,X2) %>% lapply(colMeans) %>% sapply(function(x) {x[f]}) %>% t()
+    labels <- T2 %>% t() %>% as.data.frame() %>% names() %>% gsub(pattern='V', replacement='')
+    text(center12, labels=labels, cex = 0.7, col=ifelse(T2>UCL, "red", "black"))
+    
+    ################ Plot univariate CL's
+    abline(v=XLim, lty="dashed", col="black", lwd=2)
+    abline(h=YLim, lty="dashed", col="brown", lwd=2)
+    
+    cat('\n \n')
+  }
+  
+  cat('\n \n')
+}
+
+```
+
+
+
+---
+
+# References {-}
